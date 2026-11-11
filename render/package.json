@@ -1,0 +1,1 @@
+{ "name": "views-winter-render", "private": true, "dependencies": { "puppeteer-core": "^25.17.0" } }

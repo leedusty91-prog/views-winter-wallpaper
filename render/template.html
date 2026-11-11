@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Views — Storm</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#8a939b}
+#bg{position:fixed;inset:0;background:left center/cover no-repeat}
+canvas{position:fixed;inset:0;width:100vw;height:100vh;display:block}</style></head>
+<body><div id="bg"></div><canvas id="c"></canvas>
+<script>
+(function(){
+const PLATE="__PLATE__", AUX="__AUX__";
+const T=30.0;   // loop period; every motion below is periodic in T
+const CAPTURE=new URLSearchParams(location.search).has('capture');
+document.getElementById('bg').style.backgroundImage='url('+PLATE+')';
+const cv=document.getElementById('c');
+const gl=cv.getContext('webgl2',{alpha:false,antialias:false,premultipliedAlpha:true,preserveDrawingBuffer:CAPTURE,powerPreference:'low-power'});
+if(!gl){cv.remove();return;}
+const HF=!!gl.getExtension('EXT_color_buffer_float');
+const MAXPIX=CAPTURE?1e9:2560*1664;
+function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(o)+'\n'+s.split('\n').map((l,i)=>(i+1)+': '+l).join('\n'));return o;}
+function prog(v,f){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,v));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,f));gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));return p;}
+
+// ---------------- deterministic RNG ----------------
+let rs=20261111;function rnd(){rs=(rs*1664525+1013904223)>>>0;return rs/4294967296;}
+function gauss(){let u=0;for(let i=0;i<4;i++)u+=rnd();return (u-2)*1.73;}
+
+// ---------------- lightning schedule (plate uv; x right, y down) ----------------
+// pulses: [delay s, amplitude, decay s]
+const STRIKES=[
+ {t:3.0,  x:0.715,y:0.13, bolt:true, cg:true, I:0.95, r:0.50, w:1.15, pulses:[[0,1,.05],[.08,.3,.03],[.15,.95,.06],[.33,.55,.07]]},
+ {t:9.5,  x:0.450,y:0.07, bolt:true, cg:true, I:0.95, r:0.65, w:1.6, pulses:[[0,.7,.04],[.05,1.1,.07],[.15,.35,.03],[.22,1.15,.08],[.38,.6,.05],[.47,1.0,.09],[.70,.45,.12],[.92,.2,.18]]},
+ {t:17.0, x:0.640,y:0.24, bolt:false,cg:false,I:0.85, r:0.80, w:1.0,  pulses:[[0,.5,.08],[.14,1,.10],[.28,.4,.06],[.40,.85,.12],[.65,.3,.15]]},
+ {t:23.5, x:0.600,y:0.10, bolt:true, cg:true, I:1.05, r:0.55, w:1.3,  pulses:[[0,1,.05],[.10,.4,.03],[.19,1.05,.07],[.36,.7,.06],[.55,.3,.10]]}
+];
+function strikeEnv(s,t){let tau=((t-s.t)%T+T)%T, v=0;for(const p of s.pulses){const d=tau-p[0];if(d>-0.012){const att=Math.min(1,(d+0.012)/0.012);v+=p[1]*att*Math.exp(-Math.max(d,0)/p[2]);}}return Math.min(v,1.3)*s.I;}
+// bolts: recursive midpoint displacement with branches, in plate-height units (X = uvx*plateAspect)
+const PA=16/9;
+function genBolt(s){const segs=[];
+ function rec(ax,ay,bx,by,disp,depth,level,inten){
+  if(depth===0){segs.push([ax,ay,bx,by,level,inten]);return;}
+  const dx=bx-ax,dy=by-ay,L=Math.hypot(dx,dy),nx=-dy/L,ny=dx/L,o=gauss()*disp;
+  const mx=(ax+bx)/2+nx*o,my=(ay+by)/2+ny*o;
+  rec(ax,ay,mx,my,disp*0.5,depth-1,level,inten);rec(mx,my,bx,by,disp*0.5,depth-1,level,inten);
+  if(level<3&&depth>=2&&depth<=7&&rnd()<(level===0?0.62:level===1?0.40:0.22)){
+   const ang=(rnd()<.5?-1:1)*(0.35+rnd()*0.55),c=Math.cos(ang),sn=Math.sin(ang),l=L*(0.45+rnd()*0.6);
+   const ux=dx/L,uy=dy/L,ex=mx+(ux*c-uy*sn)*l,ey=my+(ux*sn+uy*c)*l;
+   rec(mx,my,ex,ey,disp*0.6,depth-1,level+1,inten*(0.42+0.25*rnd()));}
+ }
+ const x0=s.x*PA, y0=s.y-0.02, x1=x0+(rnd()-0.5)*0.22, y1=s.cg?1.04:s.y+0.55+rnd()*0.15;
+ s.x1=x1/PA; s.y1=y1;
+ rec(x0,y0,x1,y1,0.11,9,0,1.0);return segs;}
+const boltSegs=[];STRIKES.forEach((s,i)=>{if(s.bolt)genBolt(s).forEach(g=>boltSegs.push([...g,i]));});
+
+// ---------------- shared GLSL ----------------
+const COMMON=`
+const float TAU=6.28318530718;
+uniform float uT; uniform float uPer; uniform vec2 uRes;
+float ph(float k){return TAU*k*uT/uPer;}
+float gustDisp(){return 0.110*sin(ph(1.)+0.4)+0.050*sin(ph(2.)+2.1)+0.022*sin(ph(5.)+0.7);}
+float gust(){return clamp(0.5+0.55*sin(ph(1.)+1.6)+0.25*sin(ph(3.)+1.0),0.,1.);}
+float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
+float vn(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+ return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y);}
+float vnt(vec2 p,float per){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+ float a=h21(vec2(mod(i.x,per),i.y)),b=h21(vec2(mod(i.x+1.,per),i.y)),c=h21(vec2(mod(i.x,per),i.y+1.)),d=h21(vec2(mod(i.x+1.,per),i.y+1.));
+ return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);}
+`;
+const FSQ=`#version 300 es
+in vec2 p; out vec2 vUV; void main(){vUV=p*0.5+0.5; gl_Position=vec4(p,0,1);}`;
+
+// ---------------- scene background: plate + cloud drift + in-cloud lightning + tower light + haze ----------------
+const bgFS=`#version 300 es
+precision highp float;
+${COMMON}
+in vec2 vUV; out vec4 o;
+uniform sampler2D uImg,uAux; uniform vec2 uImgSize; uniform float uLod;
+uniform sampler2D uBolt;
+uniform vec4 uS[4]; uniform vec4 uSB[4];   // uSB: bolt channel end (uv) + has-bolt      // strike: uv.x, uv.y, intensity, radius
+uniform float uFlash;    // sum of strike intensities
+vec2 coverUV(vec2 s){float as=uRes.x/uRes.y,ai=uImgSize.x/uImgSize.y;vec2 uv=vec2(s.x,1.-s.y);
+ if(as<=ai)uv.x=s.x*as/ai;else uv.y=0.5+(uv.y-0.5)*ai/as;return uv;}
+vec3 img(vec2 uv){return textureLod(uImg,uv,uLod).rgb;}
+void main(){
+ vec2 uv=coverUV(vUV);
+ vec4 ax=texture(uAux,uv);  // r: sky-warp weight, g: tower rim light, b: tower fill, a: sky (glow-able)
+ float w=ax.r; vec3 col;
+ if(w<0.002)col=img(uv);else{
+  vec2 q=uv*vec2(3.0,2.0);
+  vec2 warp=vec2(sin(q.y*2.3+ph(1.)),cos(q.x*1.9-ph(1.)+q.y*0.8))*0.0022+vec2(sin(q.y*4.1-ph(2.)+1.3),cos(q.x*3.7+ph(2.)+0.4))*0.0009;
+  vec2 flow=vec2(1.0,0.12*sin(uv.y*5.0+1.0))*0.010;
+  float p1=fract(uT/uPer*2.0),p2=fract(uT/uPer*2.0+0.5);
+  col=mix(img(uv+w*(warp-flow*(p1-0.5))),img(uv+w*(warp-flow*(p2-0.5))),abs(2.0*p1-1.0));
+ }
+ // ---- lightning: light scattered inside the cloud masses ----
+ float L=dot(col,vec3(.2126,.7152,.0722));
+ float Lb=dot(textureLod(uImg,uv,uLod+4.0).rgb,vec3(.2126,.7152,.0722));
+ float ai=uImgSize.x/uImgSize.y; vec3 glow=vec3(0); float chan=0.0;
+ float towerI=0.0;
+ for(int i=0;i<4;i++){
+  vec4 s=uS[i]; if(s.z<=0.001)continue;
+  vec2 d=(uv-s.xy)*vec2(ai,1.0);
+  float r2=dot(d,d)/(s.w*s.w);
+  float core=exp(-r2*3.0), wide=exp(-r2*0.8);
+  // thin, bright cloud edges transmit more light; dense dark cores glow from within but less
+  float trans=0.22+0.85*smoothstep(0.35,0.90,L)+0.30*smoothstep(0.04,-0.10,L-Lb);
+  float sheet=exp(-r2*0.22);
+  glow+=s.z*(core*0.30+wide*0.20+sheet*0.06)*trans*vec3(0.82,0.88,1.0);
+  if(uSB[i].w>0.5){ // light scattered by the snow-filled air around the channel (bloom)
+   vec2 A=s.xy*vec2(ai,1.0), B=uSB[i].xy*vec2(ai,1.0), P=uv*vec2(ai,1.0);
+   vec2 ab=B-A; float hh=clamp(dot(P-A,ab)/dot(ab,ab),0.,1.); float dc=length(P-A-ab*hh);
+   chan+=s.z*(exp(-dc/0.010)*0.10+exp(-dc/0.05)*0.08+exp(-dc/0.18)*0.025)*smoothstep(0.0,0.08,hh+0.02);
+  }
+  towerI+=s.z*(0.55+0.45*exp(-r2*0.15));
+ }
+ col+=col*glow*ax.a*(1.0-0.5*smoothstep(0.62,0.95,L))+glow*ax.a*0.04;
+ col+=col*min(uFlash,1.0)*0.05*ax.a;
+ col+=(col*0.4+vec3(0.05))*chan*vec3(0.85,0.9,1.0)*(0.35+0.65*ax.a);                                // faint ambient sheet in the whole sky
+ // tower: cool rim on the sky-facing side + fill, modulated by surface albedo (the plate itself)
+ vec3 tl=towerI*(ax.g*1.45+ax.b*0.30)*vec3(0.88,0.94,1.06);
+ col+=col*tl;
+ col+=texture(uBolt,vUV).rgb*ax.a;      // the tower occludes bolts behind it
+ // ---- drifting snow haze, tile periodic ----
+ float g=gust(); vec2 s=vec2(vUV.x*uRes.x/uRes.y,vUV.y);
+ float n=0.,amp=0.55,per=4.;vec2 fp=vec2(s.x*2.0-4.0*uT/uPer,s.y*1.6+0.15*sin(ph(1.)));
+ for(int k=0;k<3;k++){n+=amp*vnt(fp,per);fp=fp*2.0+vec2(0.0,3.1);per*=2.;amp*=0.5;}
+ float haze=smoothstep(0.35,0.95,n);
+ float fogA=0.04+0.12*haze*(0.35+0.65*g)+0.03*(1.0-vUV.y);
+ vec3 fogC=vec3(0.86,0.89,0.93)*(1.0+uFlash*0.35);
+ col=mix(col,fogC,fogA);
+ o=vec4(col,1.0);
+}`;
+
+// ---------------- lightning bolts (additive, distant, behind snow) ----------------
+const boltVS=`#version 300 es
+precision highp float;
+uniform vec2 uRes; uniform vec2 uImgSize; uniform float uSI[4]; uniform float uSW[4];
+in vec2 corner; in vec4 seg; in vec3 meta;   // seg: ax,ay,bx,by (plate-height units)  meta: level, intensity, strike
+out vec2 vLoc; out float vLen; out float vW; out float vI; out float vY;
+vec2 toScreen(vec2 P){ // plate-height units -> screen (x in sh units, y up 0..1)
+ float as=uRes.x/uRes.y, ai=uImgSize.x/uImgSize.y; vec2 uv=vec2(P.x/ai,P.y);
+ vec2 s; if(as<=ai){s.x=uv.x*ai/as; s.y=1.-uv.y;} else {s.x=uv.x; s.y=1.-(0.5+(uv.y-0.5)*as/ai);}
+ float sc=(as<=ai)?1.0:as/ai; return vec2(s.x*as, s.y);}
+void main(){
+ float as=uRes.x/uRes.y, ai=uImgSize.x/uImgSize.y; float sc=(as<=ai)?1.0:as/ai;
+ vec2 a=toScreen(seg.xy), b=toScreen(seg.zw);
+ vec2 d=b-a; float L=length(d); vec2 u=d/max(L,1e-6), n=vec2(-u.y,u.x);
+ int sj=int(meta.z+0.5);
+ float wcore=(meta.x<0.5?0.00090:(meta.x<1.5?0.00058:(meta.x<2.5?0.00042:0.00032)))*sc*uSW[sj];
+ float wg=wcore*9.0;
+ wg=wcore*45.0; vec2 c=(a+b)*0.5; vec2 lc=corner*vec2(L*0.5+wg*2.0, wg*2.0);
+ vec2 pos=c+u*lc.x+n*lc.y;
+ int si=int(meta.z+0.5); float I=uSI[si]*meta.y;
+ // upper branches flicker out on the weaker pulses
+ vLoc=lc; vLen=L*0.5; vW=wcore; vI=I*(meta.x>0.5?smoothstep(0.20+0.12*meta.x,0.65+0.1*meta.x,uSI[si]):1.0); vY=seg.y;
+ gl_Position=vec4(pos.x/as*2.-1., pos.y*2.-1., 0, 1);
+}`;
+const boltFS=`#version 300 es
+precision highp float;
+in vec2 vLoc; in float vLen; in float vW; in float vI; in float vY; out vec4 o;
+void main(){
+ float dx=max(abs(vLoc.x)-vLen,0.); float d=length(vec2(dx,vLoc.y));
+ float core=exp(-pow(d/vW,2.0)*1.2);
+ float glow=exp(-d/(vW*2.5))*0.55+exp(-d/(vW*9.0))*0.20+exp(-d/(vW*30.0))*0.06;
+ float atten=0.78;                                   // distance / snow-haze
+ float fadeTop=smoothstep(0.05,0.16,vY);            // emerges from the cloud base
+ float fadeBot=1.0-0.55*smoothstep(0.70,1.04,vY);   // partly swallowed by snow haze low down
+ vec3 c=vec3(1.0,1.0,1.0)*core*3.0+vec3(0.66,0.76,1.0)*glow*1.2;
+ o=vec4(c*vI*atten*fadeTop*fadeBot,0.0);
+}`;
+
+// ---------------- falling snow ----------------
+const snVS=`#version 300 es
+precision highp float;
+${COMMON}
+in vec2 corner; in vec4 seed; in vec4 seed2;
+uniform vec4 uL;   // diam min, diam max (screen-height units), fall cycles base, fall cycles range
+uniform vec4 uL2;  // drift cycles base, wind factor, turbulence amp, shutter (s)
+uniform vec4 uL3;  // turbulence freq, density-variation, defocus, unused
+uniform float uMargin;
+out vec2 vLoc; out float vLen; out float vR; out float vA; out vec4 vShape;
+float psi(vec2 q,float k){float a=ph(k);return vn(q+1.6*vec2(cos(a),sin(a)))+0.5*vn(q*2.03+vec2(5.2,1.3)+1.6*vec2(cos(a*2.),sin(a*2.)));}
+vec2 curl(vec2 q,float k){float e=0.05;return vec2(psi(q+vec2(0,e),k)-psi(q-vec2(0,e),k),-(psi(q+vec2(e,0),k)-psi(q-vec2(e,0),k)))/(2.*e);}
+vec2 posAt(float t){
+ float asp=uRes.x/uRes.y; float m=uMargin; float wW=asp+2.*m; float wH=1.+2.*m;
+ float nY=floor(uL.z+seed.w*uL.w+0.5), nX=uL2.x+floor(seed2.x*2.0), wf=uL2.y*(0.75+0.5*seed2.y);
+ float gd=0.110*sin(TAU*t/uPer+0.4)+0.050*sin(TAU*2.*t/uPer+2.1)+0.022*sin(TAU*5.*t/uPer+0.7);
+ float x=fract(seed.x+nX*t/uPer+gd*wf/wW)*wW-m;
+ float y=1.+m-fract(seed.y+nY*t/uPer)*wH;
+ return vec2(x,y);}
+void main(){
+ float asp=uRes.x/uRes.y;
+ vec2 b=posAt(uT), b0=posAt(uT-1.0/60.0);
+ vec2 q=b*uL3.x, q0=b0*uL3.x;
+ vec2 tb=curl(q,1.0)*uL2.z, tb0;
+ { float sv=uT; } 
+ vec2 P=b+tb;
+ // previous position (for motion blur): same field, one 60th earlier
+ vec2 bd=b-b0; vec2 P0=(abs(bd.x)>0.5||abs(bd.y)>0.5)?P-vec2(0.,0.):b0+curl(q0,1.0)*uL2.z;
+ vec2 vel=(P-P0)*60.0;
+ float sp=length(vel); vec2 dir=sp>1e-5?vel/sp:vec2(0,-1); vec2 nrm=vec2(-dir.y,dir.x);
+ float diam=mix(uL.x,uL.y,pow(seed.z,2.2));
+ float px=1.0/uRes.y; float r=diam*0.5; float re=max(r,0.8*px);
+ float len=sp*uL2.w*0.5;
+ // density varies in gusts: travelling bands of heavier snow
+ float a=ph(1.); float dn=vn(vec2(P.x*1.1-2.0*cos(a),P.y*0.8+2.0*sin(a)));
+ float dens=mix(1.0-uL3.y*0.6,1.0,smoothstep(0.25,0.75,dn))*(0.92+0.22*gust());
+ vA=(r*r)/(re*re)*dens*(0.55+0.45*seed2.y);
+ vec2 lc=corner*vec2(re*1.6+len, re*1.6);
+ vec2 pos=P+dir*lc.x+nrm*lc.y;
+ // tumble: rotation + foreshortening, integer cycles per loop
+ float spin=floor(1.0+seed2.z*4.0)*(seed.x<0.5?-1.:1.);
+ float rot=seed2.w*TAU+ph(spin); float squash=0.68+0.32*abs(cos(ph(floor(2.+seed.y*3.))+seed2.w*9.));
+ vShape=vec4(rot,squash,seed.z*31.7+seed2.x*7.3,uL3.z);
+ vLoc=lc; vLen=len; vR=re;
+ gl_Position=vec4(pos.x/asp*2.-1., pos.y*2.-1., 0, 1);
+}`;
+const snFS=`#version 300 es
+precision highp float;
+in vec2 vLoc; in float vLen; in float vR; in float vA; in vec4 vShape; out vec4 o;
+uniform vec4 uLook; // alpha, unused, unused, unused
+uniform float uFlash; uniform float uResY;
+void main(){
+ vec2 v=vLoc-vec2(clamp(vLoc.x,-vLen,vLen),0.0);       // offset from the motion-blur segment
+ float c=cos(vShape.x),s=sin(vShape.x); vec2 rv=vec2(c*v.x-s*v.y,s*v.x+c*v.y); rv.y/=vShape.y;
+ float ang=atan(rv.y,rv.x); float sd=vShape.z;
+ float lk=smoothstep(1.5,6.0,vR*uResY); float lobes=1.0+lk*(0.16*sin(3.*ang+sd)+0.11*sin(5.*ang+sd*1.7)+0.07*sin(8.*ang+sd*2.9));
+ float d=length(rv)/(vR*lobes);
+ float soft=mix(0.35,0.95,vShape.w);
+ float a=1.0-smoothstep(1.0-soft,1.0+soft*0.25,d);
+ if(vShape.w<0.5) a*=0.75+0.25*(1.0-d);               // in-focus flakes: brighter core
+ else a*=0.80+0.35*smoothstep(0.3,0.95,d)*(1.0-smoothstep(0.95,1.2,d)); // bokeh: faint lens rim
+ a*=uLook.x*vA*(vR/(vR+vLen*0.7));
+ if(a<0.002)discard;
+ vec3 col=vec3(0.94,0.96,0.99)*(1.0+uFlash*1.1);
+ o=vec4(col*a,a);
+}`;
+
+// ---------------- final composite: scene + frost / condensation + grain ----------------
+const finFS=`#version 300 es
+precision highp float;
+${COMMON}
+in vec2 vUV; out vec4 o;
+uniform sampler2D uScene,uAux; uniform vec2 uImgSize; uniform float uFrame; uniform float uFlash; uniform float uLod;
+uint ih(uint x){x^=x>>16;x*=0x7feb352dU;x^=x>>15;x*=0x846ca68bU;x^=x>>16;return x;}
+vec3 h32(vec2 p){vec3 q=fract(vec3(p.xyx)*vec3(.1031,.1030,.0973));q+=dot(q,q.yzx+33.33);return fract((q.xxy+q.yzz)*q.zyx);}
+float h1(float n){return fract(sin(n*127.1)*43758.5453);}
+vec2 coverUV(vec2 s){float as=uRes.x/uRes.y,ai=uImgSize.x/uImgSize.y;vec2 uv=vec2(s.x,1.-s.y);
+ if(as<=ai)uv.x=s.x*as/ai;else uv.y=0.5+(uv.y-0.5)*ai/as;return uv;}
+float ridged(vec2 p){float v=0.,a=0.5;for(int i=0;i<4;i++){v+=a*(1.0-abs(vn(p)*2.0-1.0));p=p*2.13+vec2(1.7,9.2);a*=0.5;}return v;}
+float fbm(vec2 p){return 0.5*vn(p)+0.27*vn(p*2.03+3.1)+0.15*vn(p*4.11+7.7)+0.08*vn(p*8.3+1.3);}
+vec3 shoulder(vec3 c){vec3 h=max(c-0.80,0.0);return min(c,0.80)+0.20*(1.0-exp(-h/0.20));}
+float ASP, PX;
+// best drop under this pixel
+float dA; vec2 dN; float dR; vec2 dC; float halo;
+void putDrop(vec2 s, vec2 c, float R, float a, float seed){
+ vec2 q=(s-c)/R;
+ float ang=atan(q.y,q.x);
+ q.y*= q.y<0.0 ? 0.90 : 1.10;                       // gravity: fuller at the bottom
+ q.x*= 1.0+0.30*(h1(seed)-0.5); q+=q.yx*vec2(1.0,-1.0)*0.0+vec2(0.0,0.0);
+ float r=length(q)*(1.0+0.08*sin(2.*ang+seed*9.)+0.05*sin(3.*ang+seed*4.)+0.03*sin(5.*ang+seed*2.));
+ halo=max(halo,a*(1.0-smoothstep(1.0,2.1,r)));
+ if(r<1.0 && a*R>dA*dR){dA=a; dN=q/max(r,1e-4)*r; dR=R; dC=c;}
+}
+void statics(vec2 s,float cell,float dens,float rmin,float rmax,float seed,float K,float lifeF,float clear){
+ vec2 g=s/cell; vec2 id=floor(g); vec3 r=h32(id+seed);
+ if(r.x>dens) return;
+ vec3 r2=h32(id*1.37+seed+5.1);
+ float R=mix(rmin,rmax,r2.x*r2.x*r2.x);
+ vec2 c=(id+0.5+(r.yz-0.5)*max(0.0,0.9-2.0*R/cell))*cell;
+ float ph=fract(r2.y+uT/uPer*K);
+ float env=smoothstep(0.0,0.04,ph)*(1.0-smoothstep(lifeF,1.0,ph));
+ R*=0.55+0.45*env;
+ float dd=length((c-vec2(0.38,0.90))*vec2(1.0,1.0)); // keep off Drake
+ env*=smoothstep(0.035,0.07,dd)*(1.0-clear);
+ if(env>0.01) putDrop(s,c,R,env,r2.z*7.0+seed);
+}
+// sliding drops: periodic stick-slip descent, wobbling path, wet trail that re-fogs
+float trailClear;
+float xpath(float y,float ix,vec3 h){return (ix+0.5+(h.x-0.5)*0.35)*0.09 + 0.0065*sin(TAU*(y*2.7+h.y))+0.003*sin(TAU*(y*6.3+h.z));}
+void sliders(vec2 s){
+ float ix=floor(s.x/0.09); vec3 h=vec3(h1(ix*1.131+0.71),h1(ix*2.713+3.37),h1(ix*0.377+9.13)); vec3 hb=vec3(h1(ix*5.17+1.9),h1(ix*3.91+7.3),h1(ix*7.73+4.4));
+ if(h1(ix*9.37+2.2)>0.34) return;
+ if(abs((ix+0.5)*0.09-0.38)<0.07) return;
+ float k=1.0+floor(hb.x*2.0); float m=7.0+floor(hb.y*6.0);
+ float ph=fract(hb.z+uT/uPer*k);
+ float f=ph-0.92*sin(TAU*m*ph)/(TAU*m);
+ float yc=1.12-1.3*f;
+ float R=0.0075+0.0065*h.z;
+ float xc=xpath(yc,ix,h);
+ float dx=s.x-xpath(s.y,ix,h);
+ float up=s.y-yc;
+ // trail
+ if(up>0.0 && up<0.40){
+  float age=up/0.40; float w=R*(0.70-0.30*age);
+  float tm=(1.0-smoothstep(w*0.6,w,abs(dx)))*(1.0-smoothstep(0.15,1.0,age));
+  trailClear=max(trailClear,tm);
+  // beads left behind in the trail
+  float cy=floor(s.y/0.011); vec3 hr=h32(vec2(ix*3.1,cy));
+  if(hr.x<0.55){float by=(cy+0.5)*0.011; if(by>yc+R*1.2){float bage=(by-yc)/0.40;
+   if(bage<1.0){float br=R*(0.18+0.22*hr.y)*(1.0-0.6*bage);
+    vec2 bc=vec2(xpath(by,ix,h)+(hr.z-0.5)*R*0.6,by); putDrop(s,bc,br,1.0-smoothstep(0.6,1.0,bage),hr.y*13.);}}}
+ }
+ // the drop: elongated while moving
+ float spd=1.0-0.92*cos(TAU*m*ph);
+ vec2 q=vec2(s.x-xc,s.y-yc); float st=1.0+0.25*smoothstep(0.3,1.6,spd);
+ vec2 cc=vec2(xc,yc+R*0.25*(st-1.0)*2.0);
+ if(abs(q.x)<R*1.5 && abs(q.y)<R*3.0){
+  vec2 sq=vec2(s.x,cc.y+(s.y-cc.y)/st);
+  putDrop(sq,cc,R,1.0,ix*1.7);
+ }
+}
+// snowflakes landing on the glass: arrive, splat/settle, stick in loose patches, some melt into droplets
+vec4 flk; // rgb, a
+void flakes(vec2 s,vec3 sharpC,vec3 blurC,float cell,float pres,float rmin,float rmax,float seed){
+ vec2 id=floor(s/cell); vec3 r=h32(id+seed);
+ float patchN=fbm((id+0.5)*cell*2.2+seed*0.37);                 // loose patches
+ if(r.x>pres*(0.25+1.35*smoothstep(0.30,0.70,patchN))) return;
+ vec3 r2=h32(id*1.91+seed+3.3);
+ float R0=mix(rmin,rmax,pow(r2.x,2.2));
+ vec2 c=(id+0.5+(r.yz-0.5)*max(0.0,0.92-2.3*R0/cell))*cell;
+ float dd=length(c-vec2(0.38,0.90)); if(dd<0.055) return;
+ float tau=mod(uT-r2.y*uPer,uPer);
+ bool melts=h1(r2.z*17.3+seed)<0.45;
+ float hold=melts?(4.0+8.0*r2.z):(13.0+9.0*r2.z);
+ float melt=3.0+2.5*h1(r2.x*9.1+seed), wet=4.0+5.0*h1(r2.z*5.3+seed);
+ float end=melts?hold+melt+wet:hold;                              // non-melting flakes sublimate/fade at the end
+ float fadeEnd=melts?1.0:1.0-smoothstep(hold-2.5,hold,tau);
+ float px=PX/R0;
+ // approach: the flake is still falling, soft and out of focus, just before contact
+ float pre=uPer-tau;
+ if(pre<0.22){
+  float k=1.0-pre/0.22; vec2 ap=c+vec2(0.004,0.010)*(pre/0.22);
+  float rr=R0*(1.9-0.9*k); float dq=length(s-ap)/rr;
+  float aa=0.55*k*k*(1.0-smoothstep(0.2,1.0,dq));
+  if(aa>flk.a) flk=vec4(vec3(0.93,0.95,0.98)*(1.0+0.4*uFlash),aa);
+  return;
+ }
+ if(tau>end+1.5) return;
+ float m=melts?smoothstep(hold,hold+melt,tau):0.0;
+ if(melts){
+  float dEnv=smoothstep(0.65,1.0,m)*(1.0-smoothstep(end,end+1.5,tau));
+  if(dEnv>0.01) putDrop(s,c,R0*0.42*(0.75+0.25*(1.0-smoothstep(hold+melt,end+1.5,tau))),dEnv,r2.x*31.+seed);
+  if(m>0.97) return;
+ }
+ float impact=smoothstep(0.0,0.06,tau);
+ float settle=1.0+0.28*exp(-tau/0.07);                             // splat: spreads, then settles
+ float R=R0*settle*(1.0-0.40*m);
+ vec2 p=(s-c)/R; float pr=dot(p,p); if(pr>3.2) return;
+ vec2 sp=p+r2.yz*40.0+seed;
+ float ang=atan(p.y,p.x);
+ float v=1.0-length(p*vec2(1.0,0.82+0.36*r2.z))+0.70*(fbm(sp*1.5)-0.5)+0.32*(vn(sp*5.5)-0.5)
+        +0.04*sin(6.0*ang+r2.x*20.0)*smoothstep(0.0,1.0,length(p)) -0.45*m;
+ float body=smoothstep(-px*1.2,px*2.2+0.10,v);                   // crisp: it sits on the glass plane
+ float dens=0.62+0.38*smoothstep(0.02,0.45,v)*(0.55+0.45*vn(sp*11.0));
+ float rim=smoothstep(-px*1.2,px*1.5,v)*(1.0-smoothstep(0.03,0.16,v)); // backlit translucent edge
+ // fine crystalline fringe on the bigger flakes
+ float big=smoothstep(7.0,16.0,R/PX)*(1.0-m);
+ float rg=ridged(sp*8.5+vec2(ang*1.3,0.0));
+ float fr=pow(rg,5.0)*smoothstep(-0.34,-0.03,v)*(1.0-smoothstep(-0.03,0.04,v))*big;
+ float spl=0.0;                                                   // tiny splash specks right at impact
+ if(tau<0.35){float q=length(p); spl=smoothstep(0.65,0.9,vn(p*6.0+seed))*smoothstep(0.95,1.15,q)*(1.0-smoothstep(1.3,1.7,q))*(1.0-tau/0.35);}
+ float a=clamp(body*dens+fr*0.7+spl*0.6,0.0,1.0)*impact*fadeEnd;
+ vec3 ice=mix(sharpC*1.02,vec3(0.95,0.965,0.99),0.66+0.22*smoothstep(0.05,0.4,v));
+ ice+=vec3(0.10,0.11,0.12)*rim;                                    // bright rim
+ ice=shoulder(ice*(1.0+0.38*uFlash));                              // catches the lightning, keeps its texture
+ vec3 wetc=blurC*0.84+vec3(0.035,0.04,0.045)+vec3(0.08)*rim;       // melting: translucent, grey, wet
+ vec3 fc=mix(ice,wetc,smoothstep(0.15,0.85,m));
+ a*=mix(0.92,0.55,m)*(1.0-smoothstep(0.75,0.97,m));
+ if(a>flk.a) flk=vec4(fc,a);
+}
+void main(){
+ ASP=uRes.x/uRes.y; PX=1.0/uRes.y;
+ vec2 s=vec2(vUV.x*ASP,vUV.y);
+ float expo=1.0+0.08*uFlash; vec3 sharp=shoulder(texture(uScene,vUV).rgb*expo);   // brief exposure flash
+ vec3 blurC=shoulder(expo*textureLod(uScene,vUV,uLod+1.2).rgb*0.5+textureLod(uScene,vUV+vec2(1.5,-1.0)/uRes*exp2(uLod),uLod+1.0).rgb*0.25+textureLod(uScene,vUV-vec2(1.5,-1.0)/uRes*exp2(uLod),uLod+1.0).rgb*0.25);
+ dA=0.0; dR=0.0; dN=vec2(0); dC=vec2(0); halo=0.0; trailClear=0.0; flk=vec4(0);
+ sliders(s);
+ statics(s,0.060,0.15,0.0040,0.0100,1.0,1.0,0.82,trailClear);
+ statics(s,0.022,0.30,0.0014,0.0050,7.0,2.0,0.75,trailClear);
+ statics(s,0.0085,0.58,0.00055,0.0017,13.0,1.0,0.80,trailClear*0.9);
+ statics(s+vec2(0.0042,0.0031),0.0085,0.45,0.00050,0.0013,19.0,2.0,0.70,trailClear*0.9);
+ float dx=min(s.x,ASP-s.x), dy=min(s.y,1.0-s.y);
+ float clearT=texture(uAux,coverUV(vUV)).r;
+ vec3 col=sharp;                                        // no condensation haze: the view stays as sharp as v3
+ col=mix(col,col*0.965+vec3(0.012),trailClear*0.6);     // faint wet streak where a drop slid
+ // ---- frost on the frame edges (from v2) ----
+ float corner=smoothstep(0.30,0.0,dx)*smoothstep(0.30,0.0,dy);
+ float fe=1.0-smoothstep(0.0,0.16,min(dx,dy*1.15));
+ float fr=clamp(fe*0.55+corner*0.9,0.,1.)*(0.12+0.88*clearT);
+ if(fr>0.004){
+  float pat=ridged(s*38.0)*0.75+vn(s*9.0)*0.5;
+  float fa=fr*smoothstep(0.55,1.05,pat+fr*0.6);
+  col=mix(col,blurC,clamp(fr*1.2,0.,1.));
+  col=mix(col,vec3(0.90,0.93,0.97)*(1.0+uFlash*0.25),fa*0.38+fr*0.05);
+ }
+ // ---- snow line along the bottom edge and corners, feathering into ice crystals ----
+ float bx=s.x; float cornerB=smoothstep(0.30,0.0,bx)+smoothstep(ASP-0.30,ASP,bx); float lineH=(0.0025+0.0065*fbm(vec2(bx*14.0,0.5)))*(0.45+0.55*smoothstep(0.30,0.65,fbm(vec2(bx*6.0,3.0))))+0.032*cornerB*fbm(vec2(bx*20.0,1.0));
+ float sv=lineH-s.y;
+ float snowA=smoothstep(-PX*2.0,PX*3.0,sv+0.004*(vn(vec2(bx*60.0,s.y*60.0))-0.5));
+ float feath=pow(ridged(vec2(bx*70.0,s.y*36.0)+vec2(0.0,bx*4.0)),3.5)*(1.0-smoothstep(0.0,0.012+0.03*cornerB,-sv))*step(sv,0.0);
+ float sa=clamp(snowA*0.85+feath*0.45,0.0,1.0);
+ vec3 snowC=vec3(0.92,0.94,0.97)*(0.92+0.10*vn(s*300.0))*(1.0+0.3*uFlash);
+ col=mix(col,snowC,sa);
+ // ---- flakes on the glass ----
+ flakes(s,col,blurC,0.030,0.55,0.0020,0.0055,31.7);
+ flakes(s+vec2(0.015,0.011),col,blurC,0.030,0.45,0.0018,0.0045,57.1);
+ flakes(s,col,blurC,0.052,0.50,0.0040,0.0105,83.9);
+ flakes(s+vec2(0.031,0.027),col,blurC,0.085,0.40,0.0070,0.0150,11.3);
+ if(flk.a>0.0) col=mix(col,flk.rgb,flk.a);
+ // ---- water drops: each one a tiny inverted fisheye lens of the scene ----
+ if(dA>0.0){
+  float r=length(dN); float z=sqrt(max(1.0-r*r,0.0));
+  vec2 cuv=vec2(dC.x/ASP,dC.y);
+  vec2 off=-dN*dR*(2.6+1.6*r*r);                       // flipped + minified
+  vec3 rf=shoulder(textureLod(uScene,cuv+vec2(off.x/ASP,off.y),0.0).rgb);
+  rf=mix(rf,vec3(dot(rf,vec3(0.3333))),0.10)*1.04;
+  float bottom=clamp(0.35-dN.y*0.9,0.0,1.0);
+  float edgeD=smoothstep(0.62,1.0,r);
+  rf*=1.0-edgeD*(0.08+0.55*bottom);                     // dark meniscus, heavier at the bottom
+  rf+=vec3(0.16,0.17,0.18)*smoothstep(0.45,0.78,r)*(1.0-smoothstep(0.78,0.93,r))*clamp(-dN.y*1.2,0.0,1.0)*(1.0+uFlash); // focused caustic
+  vec2 q=dN-vec2(-0.33,0.38); float sp=exp(-dot(q,q)*48.0);
+  rf+=vec3(1.0)*sp*(0.55+1.8*uFlash);                     // specular, flares with lightning
+  float aa=1.0-smoothstep(1.0-min(1.0,1.6*PX/dR),1.0,r);
+  float micro=1.0-smoothstep(1.8*PX,5.0*PX,dR);
+  rf=mix(rf,rf*(0.80+0.30*exp(-dot(q,q)*4.0)),micro);
+  float ma=mix(aa,exp(-r*r*1.6),micro);
+  col=mix(col,rf,dA*ma);
+ }
+ vec2 d=vUV-vec2(0.45,0.5); col*=1.0-0.16*dot(d,d)*1.6;
+ uvec2 ip=uvec2(gl_FragCoord.xy); uint hh=ih(ip.x+ih(ip.y+ih(uint(uFrame)+77u)));
+ col+=(float(hh&0xffffu)/65535.0+float(hh>>16)/65535.0-1.0)*0.016;
+ o=vec4(col,1.0);
+}`;
+
+// ---------------- glass: flakes that land, melt into droplets, some slide ----------------
+const glVS=`#version 300 es
+precision highp float;
+${COMMON}
+in vec2 corner; in vec4 g0; in vec4 g1;   // g0: x(sh), y, landing time, crystal radius  g1: seedA, seedB, slide amount, type
+out vec2 vLoc; out vec4 vP; out vec4 vQ; out vec2 vC; out float vType;
+void main(){
+ vType=g1.w;
+ float asp=uRes.x/uRes.y;
+ float tau=mod(uT-g0.z,uPer);
+ float Rc=g0.w, rd=Rc*(0.42+0.25*g1.x);
+ float hold=1.4+3.0*g1.y, melt=2.0+2.5*g1.x, life=hold+melt+5.0+7.0*fract(g1.x*7.7+g1.y*3.1);
+ float impact=smoothstep(0.0,0.10,tau);
+ float m=smoothstep(hold,hold+melt,tau);                 // 0 crystal -> 1 water
+ float fade=1.0-smoothstep(life,life+1.6,tau);
+ float alive=step(tau,life+1.6);
+ float cA=impact*(1.0-m)*alive, cR=Rc*(1.12-0.12*impact)*(1.0-0.55*m);
+ float dA=smoothstep(0.25,0.9,m)*fade*alive, dR=rd*smoothstep(0.0,0.8,m)*(0.55+0.45*fade);
+ // a few droplets slide in short stick-slip steps
+ float st=max(tau-(hold+melt+0.6),0.0); float steps=floor(st/1.3)+smoothstep(0.0,0.35,fract(st/1.3));
+ float slide=g1.z*min(steps,4.0)/4.0;
+ vec2 c=vec2(g0.x,g0.y-slide);
+ float ext=max(cR*1.25,dR*1.6)+0.002; float up=slide;
+ vec2 lc=vec2(corner.x*ext, corner.y>0.0? (ext+up) : -ext);
+ vLoc=lc; vP=vec4(cA,cR,dA,dR); vQ=vec4(up,g1.x,g1.y,m); vC=c;
+ vec2 pos=c+lc;
+ if(alive<0.5)pos=vec2(-9.);
+ gl_Position=vec4(pos.x/asp*2.-1., pos.y*2.-1., 0, 1);
+}`;
+const glFS=`#version 300 es
+precision highp float;
+in vec2 vLoc; in vec4 vP; in vec4 vQ; in vec2 vC; in float vType; out vec4 o;
+uniform sampler2D uScene; uniform vec2 uRes; uniform float uFlash;
+vec3 sc(vec2 p){return texture(uScene,p).rgb;}
+vec3 blur(vec2 p,float rpx){vec2 k=rpx/uRes;vec3 c=sc(p)*0.2;
+ c+=(sc(p+vec2(k.x,0))+sc(p-vec2(k.x,0))+sc(p+vec2(0,k.y))+sc(p-vec2(0,k.y)))*0.12;
+ c+=(sc(p+k*0.7)+sc(p-k*0.7)+sc(p+vec2(k.x,-k.y)*0.7)+sc(p+vec2(-k.x,k.y)*0.7))*0.08;return c;}
+float hsh(float n){return fract(sin(n*127.1)*43758.5453);}
+vec3 shoulder(vec3 c){vec3 h=max(c-0.80,0.0);return min(c,0.80)+0.20*(1.0-exp(-h/0.20));}
+void main(){
+ vec2 fuv=gl_FragCoord.xy/uRes; float asp=uRes.x/uRes.y;
+ vec3 base=shoulder(sc(fuv)); vec3 col=base; float A=0.0;
+ // --- landed flake: out of focus (the lens focuses on the tower), lacy or clumped ---
+ if(vP.x>0.003){
+  vec2 p=vLoc/vP.y; float r=length(p); float shape;
+  float sd=vQ.y*37.0+vQ.z*11.0;
+  if(vType<0.5){
+   float ang=atan(p.y,p.x)+vQ.y*6.283;
+   float sector=floor(ang/1.0472+0.5); float armL=0.62+0.38*hsh(sector+sd);
+   float a6=abs(mod(ang+0.5236,1.0472)-0.5236); float u=r*cos(a6), v=r*sin(a6);
+   float w=0.13+0.08*vQ.w;
+   float arm=exp(-pow(v/w,2.0))*(1.0-smoothstep(armL*0.75,armL,u));
+   float sB=u-v*0.577; float per=0.20+0.06*hsh(sd+3.0); float db=abs(fract(sB/per+0.5)-0.5)*per*0.866;
+   float bl=0.5*(armL-u)+0.04;
+   float br=exp(-pow(db/(w*0.75),2.0))*step(0.10,sB)*(1.0-smoothstep(bl*0.6,bl,v))*(1.0-smoothstep(armL*0.7,armL*0.95,u));
+   float hub=exp(-r*r*10.0)*0.9;
+   shape=clamp(max(max(arm,br*0.85),hub),0.,1.);
+  }else{
+   shape=0.0;
+   for(int k=0;k<5;k++){float fk=float(k);vec2 c=vec2(hsh(sd+fk)-0.5,hsh(sd+fk+9.)-0.5)*0.9;float rr=0.28+0.25*hsh(sd+fk+4.);
+    shape=max(shape,exp(-dot(p-c,p-c)/(rr*rr)*2.2));}
+   shape*=0.85;
+  }
+  float ca=shape*vP.x*0.84;
+  vec3 ice=mix(blur(fuv,3.0),vec3(0.95,0.97,1.0),0.76)+vec3(0.45,0.5,0.55)*uFlash*shape;
+  col=mix(col,shoulder(ice),ca); A=max(A,ca);
+ }
+ // --- water droplet: soft (defocused), inverted refraction, faint rim, soft glint ---
+ if(vP.z>0.003&&vP.w>0.0){
+  vec2 p=vLoc/vP.w; p.y*=1.0-0.10*clamp(vQ.x*40.0,0.,1.);
+  float ang=atan(p.y,p.x); float sd=vQ.y*53.0;
+  float r=length(p)*(1.0+0.07*sin(3.*ang+sd)+0.04*sin(5.*ang+sd*1.3));
+  float inD=1.0-smoothstep(0.72,1.0,r);
+  if(inD>0.0){
+   vec2 off=-p*vP.w*2.6*vec2(1.0/asp,1.0);
+   vec3 rf=shoulder(blur(fuv+off*0.5,2.5));
+   rf=mix(rf,vec3(dot(rf,vec3(.33))),0.15);
+   float edge=smoothstep(0.45,1.0,r);
+   rf*=1.0-edge*(0.22+0.24*clamp(p.y,0.,1.));            // darker upper rim
+   rf+=vec3(0.18)*edge*clamp(-p.y*1.3,0.,1.);             // bright lower crescent (sky refracted)
+   vec2 q=p-vec2(-0.30,0.36);
+   rf+=vec3(1.0)*exp(-dot(q,q)*20.0)*(0.48+1.5*uFlash);
+   float da=inD*vP.z*0.92;
+   col=mix(col,rf,da); A=max(A,da);
+  }
+  if(vQ.x>0.0005){
+   float ty=vLoc.y; float tw=vP.w*0.30;
+   float tr=(1.0-smoothstep(tw*0.3,tw,abs(vLoc.x)))*smoothstep(0.0,vP.w*0.6,ty)*(1.0-smoothstep(vQ.x*0.5,vQ.x+vP.w*0.5,ty));
+   vec3 tc=shoulder(blur(fuv+vec2(vLoc.x*0.5/asp,0.0),2.0))*1.03;
+   float ta=tr*0.30*vP.z;
+   col=mix(col,tc,ta*(1.0-A)); A=max(A,ta);
+  }
+ }
+ if(A<0.002)discard;
+ o=vec4(col*A,A);
+}`;
+
+// ---------------- GL objects ----------------
+const bgP=prog(FSQ,bgFS), boltP=prog(boltVS,boltFS), snP=prog(snVS,snFS), finP=prog(FSQ,finFS), glP=prog(glVS,glFS);
+const U={};function u(p,n){const k=n+'@'+(p===bgP?'b':p===boltP?'l':p===snP?'s':p===finP?'f':'g');if(!(k in U))U[k]=gl.getUniformLocation(p,n);return U[k];}
+const quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+function fsVAO(p){const v=gl.createVertexArray();gl.bindVertexArray(v);const l=gl.getAttribLocation(p,'p');gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0);return v;}
+const bgVAO=fsVAO(bgP), finVAO=fsVAO(finP);
+function instVAO(p,data,stride,attrs){const v=gl.createVertexArray();gl.bindVertexArray(v);
+ gl.bindBuffer(gl.ARRAY_BUFFER,quad);let c=gl.getAttribLocation(p,'corner');gl.enableVertexAttribArray(c);gl.vertexAttribPointer(c,2,gl.FLOAT,false,0,0);
+ const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);
+ let off=0;for(const [name,n] of attrs){const l=gl.getAttribLocation(p,name);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,n,gl.FLOAT,false,stride*4,off*4);gl.vertexAttribDivisor(l,1);off+=n;}
+ return v;}
+// snow layers: [count, dMin, dMax, fallBase, fallRange, driftBase, wind, turbAmp, shutter, turbFreq, densVar, defocus, alpha]
+const LAYERS=[
+ [14000,0.0010,0.0018, 1,2, 1,0.30,0.010,0.012, 2.2,0.55,0.9, 0.60],
+ [ 7000,0.0018,0.0030, 2,2, 2,0.55,0.016,0.012, 2.6,0.50,0.7, 0.68],
+ [ 3200,0.0030,0.0068, 3,3, 2,0.90,0.024,0.012, 3.0,0.45,0.48,0.85],
+ [  380,0.0080,0.0160, 6,4, 3,1.40,0.040,0.010, 3.4,0.40,0.62,0.55],
+ [   30,0.0360,0.0900, 9,5, 5,2.20,0.060,0.007, 3.8,0.30,1.0, 0.15]
+];
+const snowVAOs=LAYERS.map(L=>{const n=L[0],s=new Float32Array(n*8);for(let i=0;i<n*8;i++)s[i]=rnd();return instVAO(snP,s,8,[['seed',4],['seed2',4]]);});
+const bd=new Float32Array(boltSegs.length*7);boltSegs.forEach((g,i)=>bd.set([g[0],g[1],g[2],g[3],g[4],g[5],g[6]],i*7));
+const boltVAO=instVAO(boltP,bd,7,[['seg',4],['meta',3]]);
+// glass events: deterministic landing times spread over the loop; keep clear of Drake
+const NG=128, gd=new Float32Array(NG*8);
+for(let i=0;i<NG;i++){let x,y;for(;;){x=rnd()*1.78;y=rnd();const dx=x-0.473,dy=y-0.885;if(dx*dx+dy*dy>0.10*0.10)break;}
+ // mostly small, a few medium (v3: Rc=0.016+0.026*rnd^1.6)
+ const t0=(i+rnd()*0.8)/NG*T, Rc=0.0072+0.0105*Math.pow(rnd(),2.0)+(rnd()<0.12?0.006:0);
+ gd.set([x,y,t0,Rc, rnd(),rnd(), rnd()<0.3?0.012+0.03*rnd():0, rnd()<0.4?1:0],i*8);}
+const glassVAO=instVAO(glP,gd,8,[['g0',4],['g1',4]]);
+
+function tex(src,mip){return new Promise(res=>{const im=new Image();im.onload=()=>{const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+ gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,im);
+ if(mip){gl.generateMipmap(gl.TEXTURE_2D);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);}else gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+ res({t,w:im.width,h:im.height});};im.src=src;});}
+let plate,aux,W=0,H=0,fbo=null,fboTex=null,boltFbo=null,boltTex=null;
+function resize(){const dpr=window.devicePixelRatio||1;let w=Math.round(innerWidth*dpr),h=Math.round(innerHeight*dpr);
+ const s=Math.min(1,Math.sqrt(MAXPIX/(w*h)));w=Math.round(w*s);h=Math.round(h*s);
+ if(w!==W||h!==H){W=w;H=h;cv.width=w;cv.height=h;
+  if(fboTex)gl.deleteTexture(fboTex);if(fbo)gl.deleteFramebuffer(fbo);
+  fboTex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,fboTex);if(HF)gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,W,H,0,gl.RGBA,gl.HALF_FLOAT,null);else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,W,H,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  fbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,fboTex,0);
+  if(boltTex)gl.deleteTexture(boltTex);if(boltFbo)gl.deleteFramebuffer(boltFbo);
+  boltTex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,boltTex);if(HF)gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,W,H,0,gl.RGBA,gl.HALF_FLOAT,null);else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,W,H,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  boltFbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,boltFbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,boltTex,0);}}
+function common(p,t){gl.uniform2f(u(p,'uRes'),W,H);gl.uniform1f(u(p,'uT'),t);gl.uniform1f(u(p,'uPer'),T);}
+function draw(t,frame){
+ resize();
+ const env=STRIKES.map(s=>strikeEnv(s,t)); const flash=env.reduce((a,b)=>a+b,0);
+ // 0 bolts into their own buffer (MAX blend: no glow pile-up where segments overlap)
+ gl.bindFramebuffer(gl.FRAMEBUFFER,boltFbo);gl.viewport(0,0,W,H);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);
+ if(flash>0.003){gl.enable(gl.BLEND);gl.blendEquation(gl.MAX);gl.blendFunc(gl.ONE,gl.ONE);gl.useProgram(boltP);gl.bindVertexArray(boltVAO);
+  gl.uniform2f(u(boltP,'uRes'),W,H);gl.uniform2f(u(boltP,'uImgSize'),plate.w,plate.h);gl.uniform1fv(u(boltP,'uSI'),env);gl.uniform1fv(u(boltP,'uSW'),STRIKES.map(s=>s.w));
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,boltSegs.length);gl.blendEquation(gl.FUNC_ADD);}
+ gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.viewport(0,0,W,H);
+ // 1 background
+ gl.disable(gl.BLEND);gl.useProgram(bgP);gl.bindVertexArray(bgVAO);common(bgP,t);
+ gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,plate.t);gl.uniform1i(u(bgP,'uImg'),0);
+ gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,aux.t);gl.uniform1i(u(bgP,'uAux'),1);
+ gl.uniform2f(u(bgP,'uImgSize'),plate.w,plate.h);
+ const asp=W/H,ai=plate.w/plate.h,scale=(asp<=ai)?plate.h/H:plate.w/W;
+ gl.uniform1f(u(bgP,'uLod'),Math.max(0,Math.log2(scale)-0.7));
+ const sv=[];STRIKES.forEach((s,i)=>sv.push(s.x,s.y,env[i],s.r));gl.uniform4fv(u(bgP,'uS'),sv);gl.uniform4fv(u(bgP,'uSB'),STRIKES.flatMap(s=>s.bolt?[s.x1,s.y1,0,1]:[0,0,0,0]));gl.uniform1f(u(bgP,'uFlash'),flash);
+ gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,boltTex);gl.uniform1i(u(bgP,'uBolt'),2);
+ gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+ gl.enable(gl.BLEND);
+ gl.enable(gl.BLEND);
+ // 3 snow
+ gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.useProgram(snP);common(snP,t);gl.uniform1f(u(snP,'uFlash'),Math.min(flash,1.2));gl.uniform1f(u(snP,'uResY'),H);
+ LAYERS.forEach((L,i)=>{gl.bindVertexArray(snowVAOs[i]);
+  gl.uniform4f(u(snP,'uL'),L[1],L[2],L[3],L[4]);gl.uniform4f(u(snP,'uL2'),L[5],L[6],L[7],L[8]);
+  gl.uniform4f(u(snP,'uL3'),L[9],L[10],L[11],0);gl.uniform4f(u(snP,'uLook'),L[12],0,0,0);
+  gl.uniform1f(u(snP,'uMargin'),Math.max(0.07,L[2]*1.5+0.10));
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,L[0]);});
+ // 4 final to screen
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,W,H);gl.disable(gl.BLEND);
+ gl.useProgram(finP);gl.bindVertexArray(finVAO);common(finP,t);
+ gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,fboTex);gl.generateMipmap(gl.TEXTURE_2D);gl.uniform1i(u(finP,'uScene'),0);gl.uniform1f(u(finP,'uLod'),Math.max(0,Math.log2(H/1080)));
+ gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,aux.t);gl.uniform1i(u(finP,'uAux'),1);
+ gl.uniform2f(u(finP,'uImgSize'),plate.w,plate.h);gl.uniform1f(u(finP,'uFrame'),frame%97);gl.uniform1f(u(finP,'uFlash'),Math.min(flash,1.6));
+ gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+}
+Promise.all([tex(PLATE,true),tex(AUX,false)]).then(([p,a])=>{plate=p;aux=a;
+ document.getElementById('bg').style.display='none';
+ if(CAPTURE){window.renderAt=(t,f)=>{draw(t,f);gl.finish();return true;};window.STRIKES=STRIKES;window.GD=Array.from(gd);window.ready=true;return;}
+ let f=0;const t0=performance.now();
+ function loop(now){draw(((now-t0)/1000)%T,f++);requestAnimationFrame(loop);}requestAnimationFrame(loop);
+});
+})();
+</script></body></html>
